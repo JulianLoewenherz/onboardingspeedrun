@@ -19,12 +19,13 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Onboard a new team member across all tools.")
-    parser.add_argument("--name",            required=True)
-    parser.add_argument("--email",           required=True)
-    parser.add_argument("--role",            required=True)
-    parser.add_argument("--team",            required=True)
-    parser.add_argument("--github-username", required=False, default=None, help="New hire's GitHub username (e.g. alexchen)")
-    parser.add_argument("--verbose", "-v",   action="store_true", help="Show full agent responses and tool calls")
+    parser.add_argument("--name",             required=True)
+    parser.add_argument("--email",            required=True)
+    parser.add_argument("--role",             required=True)
+    parser.add_argument("--team",             required=True)
+    parser.add_argument("--github-username",  required=False, default=None, help="New hire's GitHub username (e.g. julianpt2)")
+    parser.add_argument("--slack-invite-url", required=False, default=None, help="Slack workspace invite link to include in welcome email")
+    parser.add_argument("--verbose", "-v",    action="store_true", help="Show full agent responses and tool calls")
     return parser.parse_args()
 
 
@@ -86,6 +87,15 @@ def detect_auth_required(text: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Extract Notion page URL from agent response
+# ---------------------------------------------------------------------------
+
+def extract_notion_url(text: str) -> str | None:
+    match = re.search(r'https://www\.notion\.so/\S+', text)
+    return match.group(0).rstrip(').,]') if match else None
+
+
+# ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
@@ -123,7 +133,7 @@ def log_tool_calls(result):
 def run_step(agent, prompt, verbose=False):
     """
     Run one agent step with retry on rate limit (429).
-    Always prints the full agent response.
+    Always prints tool calls and full agent response.
     Returns (success, output, auth_url).
     """
     if verbose:
@@ -148,11 +158,9 @@ def run_step(agent, prompt, verbose=False):
             else:
                 raise
 
-    # Always show tool calls
     print(f"\n  ⏱  {elapsed:.1f}s — Tool calls made:")
     log_tool_calls(result)
 
-    # Always show full agent response
     print(f"\n  Agent response:\n  {'─'*40}")
     for line in output.strip().split("\n"):
         print(f"  {line}")
@@ -169,7 +177,15 @@ def run_step(agent, prompt, verbose=False):
 # Step prompts
 # ---------------------------------------------------------------------------
 
-def prompt_gmail(name, email, role, team):
+def prompt_gmail(name, email, role, team, notion_url=None, slack_invite_url=None):
+    links_section = ""
+    if notion_url or slack_invite_url:
+        links_section = "\n- A 'Your Links' section with the following:\n"
+        if notion_url:
+            links_section += f"  * Notion onboarding page: {notion_url}\n"
+        if slack_invite_url:
+            links_section += f"  * Join our Slack workspace: {slack_invite_url}\n"
+
     return (
         f"Send an email using Gmail to {email} with:\n"
         f'Subject: "Welcome to the team, {name}! 🎉"\n'
@@ -178,6 +194,7 @@ def prompt_gmail(name, email, role, team):
         f"- Their role ({role}) and team ({team})\n"
         f"- What their first week will look like (standup, 1:1s, getting set up)\n"
         f"- A note that their accounts and tools are being set up right now\n"
+        f"{links_section}"
         f'- Sign off as: "The Onboarding Bot, powered by Composio"'
     )
 
@@ -199,8 +216,6 @@ def prompt_github(email, github_repo, github_username=None):
 
 
 def prompt_slack(name, role, team):
-    # Note: inviting users to a Slack workspace requires admin.users:write scope
-    # which is not available via standard OAuth. We skip that and just post announcements.
     return (
         f"Post the following two messages in Slack (workspace: testingworksp-2az7337.slack.com):\n"
         f"1. To #all-testing-workspace: \"👋 Please welcome {name} to the team! "
@@ -245,15 +260,21 @@ def main():
     env = validate_env()
     verbose = args.verbose
 
-    name            = args.name
-    email           = args.email
-    role            = args.role
-    team            = args.team
-    github_username = args.github_username
+    name             = args.name
+    email            = args.email
+    role             = args.role
+    team             = args.team
+    github_username  = args.github_username
+    slack_invite_url = args.slack_invite_url
 
     github_repo    = env["GITHUB_REPO"]
     notion_page_id = env["NOTION_PARENT_PAGE_ID"]
     slack_enabled  = env["SLACK_ENABLED"]
+
+    if slack_invite_url:
+        print(f"  Slack invite URL provided — will include in welcome email.")
+    else:
+        print(f"  ℹ️  No --slack-invite-url provided — Slack link won't appear in email.")
 
     print(f"\n🚀 Starting onboarding for {name} ({email}) — {role} @ {team}\n")
 
@@ -287,61 +308,129 @@ def main():
         ],
     )
 
-    # Steps: (label, app_name, prompt_or_None)
-    steps = [
-        ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
-        ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo, github_username) if github_repo else None),
-        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, role, team) if slack_enabled else None),
-        ("📝 Creating Notion page",    "Notion", prompt_notion(name, email, role, team, notion_page_id) if notion_page_id else None),
-    ]
-
-    total    = len(steps)
     results  = {}
     failures = []
+    notion_url = None
 
-    for i, (label, app, prompt) in enumerate(steps, start=1):
-        print(f"{'='*50}")
-        prefix = f"[{i}/{total}] {label}"
-
-        if prompt is None:
-            print(f"{prefix}... ⏭  Skipped (not configured)")
-            continue
-
-        print(f"{prefix}...")
-
+    # ------------------------------------------------------------------
+    # Step 1 — Notion (run first so we can include the URL in the email)
+    # ------------------------------------------------------------------
+    notion_label = "📝 Creating Notion page"
+    print(f"{'='*50}")
+    if notion_page_id:
+        print(f"[1/4] {notion_label}...")
         try:
-            success, output, auth_url = run_step(agent, prompt, verbose=verbose)
-
+            success, output, auth_url = run_step(agent, prompt_notion(name, email, role, team, notion_page_id), verbose=verbose)
             if success:
-                print(f"✓ {label} — Done")
-                results[label] = output
-            else:
-                print(f"✗ {label} — Auth required")
-                failures.append((label, app, output, auth_url))
-                if auth_url:
-                    print(f"  → Connect {app} here: {auth_url}")
+                notion_url = extract_notion_url(output)
+                print(f"✓ {notion_label} — Done")
+                if notion_url:
+                    print(f"  📎 Page URL: {notion_url}")
                 else:
-                    print(f"  → Visit https://app.composio.dev → All Toolkits → connect {app}")
-
+                    print("  ⚠️  Could not extract Notion page URL from response")
+                results[notion_label] = output
+            else:
+                print(f"✗ {notion_label} — Auth required")
+                failures.append((notion_label, "Notion", output, auth_url))
+                if auth_url:
+                    print(f"  → Connect Notion here: {auth_url}")
         except Exception as exc:
-            msg = str(exc)
-            print(f"✗ {label} — Error: {msg}")
-            failures.append((label, app, msg, None))
+            print(f"✗ {notion_label} — Error: {exc}")
+            failures.append((notion_label, "Notion", str(exc), None))
+    else:
+        print(f"[1/4] {notion_label}... ⏭  Skipped (NOTION_PARENT_PAGE_ID not set)")
 
+    # ------------------------------------------------------------------
+    # Step 2 — Gmail (now has Notion URL + Slack invite link)
+    # ------------------------------------------------------------------
+    gmail_label = "📧 Sending welcome email"
+    print(f"{'='*50}")
+    print(f"[2/4] {gmail_label}...")
+    if notion_url:
+        print(f"  ℹ️  Including Notion page URL in email: {notion_url}")
+    if slack_invite_url:
+        print(f"  ℹ️  Including Slack invite URL in email: {slack_invite_url}")
+    try:
+        success, output, auth_url = run_step(
+            agent,
+            prompt_gmail(name, email, role, team, notion_url=notion_url, slack_invite_url=slack_invite_url),
+            verbose=verbose,
+        )
+        if success:
+            print(f"✓ {gmail_label} — Done")
+            results[gmail_label] = output
+        else:
+            print(f"✗ {gmail_label} — Auth required")
+            failures.append((gmail_label, "Gmail", output, auth_url))
+            if auth_url:
+                print(f"  → Connect Gmail here: {auth_url}")
+    except Exception as exc:
+        print(f"✗ {gmail_label} — Error: {exc}")
+        failures.append((gmail_label, "Gmail", str(exc), None))
+
+    # ------------------------------------------------------------------
+    # Step 3 — GitHub
+    # ------------------------------------------------------------------
+    github_label = "🐙 Inviting to GitHub repo"
+    print(f"{'='*50}")
+    if github_repo:
+        print(f"[3/4] {github_label}...")
+        try:
+            success, output, auth_url = run_step(agent, prompt_github(email, github_repo, github_username), verbose=verbose)
+            if success:
+                print(f"✓ {github_label} — Done")
+                results[github_label] = output
+            else:
+                print(f"✗ {github_label} — Auth required")
+                failures.append((github_label, "GitHub", output, auth_url))
+                if auth_url:
+                    print(f"  → Connect GitHub here: {auth_url}")
+        except Exception as exc:
+            print(f"✗ {github_label} — Error: {exc}")
+            failures.append((github_label, "GitHub", str(exc), None))
+    else:
+        print(f"[3/4] {github_label}... ⏭  Skipped (GITHUB_REPO not set)")
+
+    # ------------------------------------------------------------------
+    # Step 4 — Slack
+    # ------------------------------------------------------------------
+    slack_label = "💬 Posting to Slack"
+    print(f"{'='*50}")
+    if slack_enabled:
+        print(f"[4/4] {slack_label}...")
+        try:
+            success, output, auth_url = run_step(agent, prompt_slack(name, role, team), verbose=verbose)
+            if success:
+                print(f"✓ {slack_label} — Done")
+                results[slack_label] = output
+            else:
+                print(f"✗ {slack_label} — Auth required")
+                failures.append((slack_label, "Slack", output, auth_url))
+                if auth_url:
+                    print(f"  → Connect Slack here: {auth_url}")
+        except Exception as exc:
+            print(f"✗ {slack_label} — Error: {exc}")
+            failures.append((slack_label, "Slack", str(exc), None))
+    else:
+        print(f"[4/4] {slack_label}... ⏭  Skipped (SLACK_ENABLED not set)")
+
+    # ------------------------------------------------------------------
     # Final summary
-    skipped   = sum(1 for s in steps if s[2] is None)
-    succeeded = len(results)
+    # ------------------------------------------------------------------
     print(f"\n{'='*50}")
     if not failures:
         print(f"🎉 Onboarding complete for {name}!")
     else:
-        print(f"⚠️  Onboarding finished: {succeeded} done, {len(failures)} failed, {skipped} skipped")
+        print(f"⚠️  Onboarding finished: {len(results)} done, {len(failures)} failed")
 
     if results:
         print("\nCompleted:")
         for label, output in results.items():
             first_line = output.strip().split("\n")[0][:120]
             print(f"  ✓ {label}: {first_line}")
+
+    if notion_url:
+        print(f"\n  📎 Notion page: {notion_url}")
 
     if failures:
         print("\nFailed (action needed):")
