@@ -90,24 +90,28 @@ def detect_auth_required(text: str) -> tuple[bool, str | None]:
 # ---------------------------------------------------------------------------
 
 def log_tool_calls(result):
-    """Extract and print every tool call the agent made."""
+    """Extract and print every tool call the agent made via raw_responses."""
     try:
-        for msg in result.new_messages():
-            # Tool call requests (assistant side)
-            if hasattr(msg, "content") and isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        print(f"     🔧 Tool call: {block.name}")
-                        if hasattr(block, "input") and block.input:
-                            for k, v in block.input.items():
-                                val_str = str(v)[:120]
-                                print(f"        {k}: {val_str}")
-            # Tool results (tool side)
-            if hasattr(msg, "role") and msg.role == "tool":
-                content = getattr(msg, "content", "")
-                if isinstance(content, list):
-                    content = " ".join(str(c) for c in content)
-                print(f"     📥 Tool result: {str(content)[:300]}")
+        found_any = False
+        for response in result.raw_responses:
+            for item in getattr(response, "output", []):
+                item_type = getattr(item, "type", "")
+                if item_type == "mcp_call":
+                    found_any = True
+                    print(f"     🔧 Tool call: {getattr(item, 'name', '?')}")
+                    inp = getattr(item, "arguments", None) or getattr(item, "input", None)
+                    if inp:
+                        if isinstance(inp, dict):
+                            for k, v in inp.items():
+                                print(f"        {k}: {str(v)[:120]}")
+                        else:
+                            print(f"        args: {str(inp)[:200]}")
+                elif item_type == "mcp_result":
+                    found_any = True
+                    content = getattr(item, "output", "") or getattr(item, "content", "")
+                    print(f"     📥 Tool result: {str(content)[:300]}")
+        if not found_any:
+            print("     (no tool calls recorded in raw_responses)")
     except Exception as e:
         print(f"     (could not extract tool calls: {e})")
 
@@ -194,14 +198,15 @@ def prompt_github(email, github_repo, github_username=None):
     )
 
 
-def prompt_slack(name, email, role, team):
+def prompt_slack(name, role, team):
+    # Note: inviting users to a Slack workspace requires admin.users:write scope
+    # which is not available via standard OAuth. We skip that and just post announcements.
     return (
-        f"Do the following in Slack (workspace: testingworksp-2az7337.slack.com):\n"
-        f"1. Invite the email address {email} to the Slack workspace.\n"
-        f"2. Post to #all-testing-workspace: \"👋 Please welcome {name} to the team! "
+        f"Post the following two messages in Slack (workspace: testingworksp-2az7337.slack.com):\n"
+        f"1. To #all-testing-workspace: \"👋 Please welcome {name} to the team! "
         f"They're joining as {role} on the {team} team. Say hello!\"\n"
-        f"3. Post to #social: \"{name} | {role} | {team} — starting today!\"\n"
-        f"For each action, confirm whether it succeeded or failed."
+        f"2. To #social: \"{name} | {role} | {team} — starting today!\"\n"
+        f"Confirm whether each message was posted successfully."
     )
 
 
@@ -224,8 +229,10 @@ def prompt_notion(name, email, role, team, notion_page_id):
         f"     * Meet with each team member (Week 1)\n"
         f"     * 30-day goals check-in\n"
         f'   - H2 section "Your Tools" listing: GitHub, Slack, Notion, Gmail\n'
-        f"2. Invite {email} to the Notion workspace so they can access the page.\n"
-        f"Return the URL of the created page and confirm whether the invite was sent."
+        f"2. After creating the page, share it with {email} using the Notion share/invite tool "
+        f"   on the newly created page (not the whole workspace — just that page). "
+        f"   Use role 'reader' or 'editor'.\n"
+        f"Return the URL of the created page and confirm whether the page share succeeded."
     )
 
 
@@ -284,7 +291,7 @@ def main():
     steps = [
         ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
         ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo, github_username) if github_repo else None),
-        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, email, role, team) if slack_enabled else None),
+        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, role, team) if slack_enabled else None),
         ("📝 Creating Notion page",    "Notion", prompt_notion(name, email, role, team, notion_page_id) if notion_page_id else None),
     ]
 
