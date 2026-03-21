@@ -19,11 +19,12 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Onboard a new team member across all tools.")
-    parser.add_argument("--name",  required=True)
-    parser.add_argument("--email", required=True)
-    parser.add_argument("--role",  required=True)
-    parser.add_argument("--team",  required=True)
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show full agent responses and tool calls")
+    parser.add_argument("--name",            required=True)
+    parser.add_argument("--email",           required=True)
+    parser.add_argument("--role",            required=True)
+    parser.add_argument("--team",            required=True)
+    parser.add_argument("--github-username", required=False, default=None, help="New hire's GitHub username (e.g. alexchen)")
+    parser.add_argument("--verbose", "-v",   action="store_true", help="Show full agent responses and tool calls")
     return parser.parse_args()
 
 
@@ -117,17 +118,31 @@ def log_tool_calls(result):
 
 def run_step(agent, prompt, verbose=False):
     """
-    Run one agent step.
+    Run one agent step with retry on rate limit (429).
     Always prints the full agent response.
     Returns (success, output, auth_url).
     """
     if verbose:
         print(f"\n  PROMPT →\n  {prompt}\n")
 
-    t0 = time.time()
-    result = Runner.run_sync(starting_agent=agent, input=prompt)
-    elapsed = time.time() - t0
-    output = result.final_output or ""
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            t0 = time.time()
+            result = Runner.run_sync(starting_agent=agent, input=prompt)
+            elapsed = time.time() - t0
+            output = result.final_output or ""
+            break
+        except Exception as exc:
+            msg = str(exc)
+            if "429" in msg or "rate_limit" in msg.lower():
+                wait = 30 * attempt
+                print(f"\n  ⏳ Rate limit hit (attempt {attempt}/{max_retries}) — waiting {wait}s...")
+                time.sleep(wait)
+                if attempt == max_retries:
+                    raise
+            else:
+                raise
 
     # Always show tool calls
     print(f"\n  ⏱  {elapsed:.1f}s — Tool calls made:")
@@ -163,12 +178,19 @@ def prompt_gmail(name, email, role, team):
     )
 
 
-def prompt_github(email, github_repo):
+def prompt_github(email, github_repo, github_username=None):
     owner, repo = github_repo.split("/", 1)
+    identity = f"username '{github_username}'" if github_username else f"email address {email}"
+    username_note = (
+        f"Use the GitHub username '{github_username}'."
+        if github_username
+        else f"No GitHub username was provided — try using the email address {email} directly."
+    )
     return (
-        f"Invite the email address {email} as a collaborator to the GitHub repository '{repo}' owned by '{owner}'. "
-        f"Use the 'add collaborator to repo' tool with the email address {email} directly — do NOT look up a username. "
-        f"The full repo path is {github_repo}."
+        f"Invite {identity} as a collaborator to the GitHub repository '{repo}' owned by '{owner}'. "
+        f"{username_note} "
+        f"The full repo path is {github_repo}. "
+        f"Use the add-collaborator-to-repo tool (not an org invite)."
     )
 
 
@@ -216,10 +238,11 @@ def main():
     env = validate_env()
     verbose = args.verbose
 
-    name  = args.name
-    email = args.email
-    role  = args.role
-    team  = args.team
+    name            = args.name
+    email           = args.email
+    role            = args.role
+    team            = args.team
+    github_username = args.github_username
 
     github_repo    = env["GITHUB_REPO"]
     notion_page_id = env["NOTION_PARENT_PAGE_ID"]
@@ -243,7 +266,7 @@ def main():
             "For each sub-task, report: what you did, whether it succeeded or failed, and any relevant URLs or IDs. "
             "If a tool is unavailable or requires authentication, say so explicitly."
         ),
-        model="gpt-4o",
+        model="gpt-4o-mini",
         tools=[
             HostedMCPTool(
                 tool_config={
@@ -260,7 +283,7 @@ def main():
     # Steps: (label, app_name, prompt_or_None)
     steps = [
         ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
-        ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo) if github_repo else None),
+        ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo, github_username) if github_repo else None),
         ("💬 Posting to Slack",        "Slack",  prompt_slack(name, email, role, team) if slack_enabled else None),
         ("📝 Creating Notion page",    "Notion", prompt_notion(name, email, role, team, notion_page_id) if notion_page_id else None),
     ]
