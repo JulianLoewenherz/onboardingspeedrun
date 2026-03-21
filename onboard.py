@@ -7,57 +7,12 @@ import re
 import sys
 import time
 from datetime import date
+from typing import Generator
 from dotenv import load_dotenv
 from composio import Composio
 from agents import Agent, Runner, HostedMCPTool
 
 load_dotenv()
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Onboard a new team member across all tools.")
-    parser.add_argument("--name",             required=True)
-    parser.add_argument("--email",            required=True)
-    parser.add_argument("--role",             required=True)
-    parser.add_argument("--team",             required=True)
-    parser.add_argument("--github-username",  required=False, default=None, help="New hire's GitHub username (e.g. julianpt2)")
-    parser.add_argument("--slack-invite-url", required=False, default=None, help="Slack workspace invite link to include in welcome email")
-    parser.add_argument("--verbose", "-v",    action="store_true", help="Show full agent responses and tool calls")
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Startup validation
-# ---------------------------------------------------------------------------
-
-def validate_env():
-    required = {
-        "COMPOSIO_API_KEY": os.getenv("COMPOSIO_API_KEY"),
-        "OPENAI_API_KEY":   os.getenv("OPENAI_API_KEY"),
-        "COMPOSIO_USER_ID": os.getenv("COMPOSIO_USER_ID"),
-    }
-    optional = {
-        "GITHUB_REPO":           os.getenv("GITHUB_REPO"),
-        "NOTION_PARENT_PAGE_ID": os.getenv("NOTION_PARENT_PAGE_ID"),
-        "SLACK_ENABLED":         os.getenv("SLACK_ENABLED", "").lower() in ("1", "true", "yes"),
-    }
-
-    missing_required = [k for k, v in required.items() if not v]
-    if missing_required:
-        print(f"❌ Missing required env vars: {', '.join(missing_required)}")
-        sys.exit(1)
-
-    if not optional["GITHUB_REPO"]:
-        print("⚠️  GITHUB_REPO not set — GitHub step will be skipped.")
-    if not optional["NOTION_PARENT_PAGE_ID"]:
-        print("⚠️  NOTION_PARENT_PAGE_ID not set — Notion step will be skipped.")
-    if not optional["SLACK_ENABLED"]:
-        print("⚠️  SLACK_ENABLED not set — Slack step will be skipped. Set SLACK_ENABLED=true in .env when ready.")
-
-    return optional
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +170,14 @@ def prompt_github(email, github_repo, github_username=None):
     )
 
 
-def prompt_slack(name, role, team):
+def prompt_slack(name, role, team, slack_channels=None):
+    channels = slack_channels or ["#all-testing-workspace", "#social"]
+    ch1, ch2 = (channels + ["#social"])[:2]
     return (
         f"Post the following two messages in Slack (workspace: testingworksp-2az7337.slack.com):\n"
-        f"1. To #all-testing-workspace: \"👋 Please welcome {name} to the team! "
+        f"1. To {ch1}: \"👋 Please welcome {name} to the team! "
         f"They're joining as {role} on the {team} team. Say hello!\"\n"
-        f"2. To #social: \"{name} | {role} | {team} — starting today!\"\n"
+        f"2. To {ch2}: \"{name} | {role} | {team} — starting today!\"\n"
         f"Confirm whether each message was posted successfully."
     )
 
@@ -252,38 +209,66 @@ def prompt_notion(name, email, role, team, notion_page_id):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Core onboarding logic — importable generator
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
-    env = validate_env()
-    verbose = args.verbose
+class OnboardingConfig:
+    """All parameters needed to run an onboarding."""
+    def __init__(
+        self,
+        name: str,
+        email: str,
+        role: str,
+        team: str,
+        github_username: str | None = None,
+        slack_invite_url: str | None = None,
+        # integration toggles
+        enable_notion: bool = True,
+        enable_gmail: bool = True,
+        enable_github: bool = True,
+        enable_slack: bool = True,
+        # workspace config (overrides env vars when provided)
+        github_repo: str | None = None,
+        notion_parent_page_id: str | None = None,
+        slack_channels: list[str] | None = None,
+        verbose: bool = False,
+    ):
+        self.name = name
+        self.email = email
+        self.role = role
+        self.team = team
+        self.github_username = github_username
+        self.slack_invite_url = slack_invite_url
+        self.enable_notion = enable_notion
+        self.enable_gmail = enable_gmail
+        self.enable_github = enable_github
+        self.enable_slack = enable_slack
+        self.github_repo = github_repo or os.getenv("GITHUB_REPO")
+        self.notion_parent_page_id = notion_parent_page_id or os.getenv("NOTION_PARENT_PAGE_ID")
+        self.slack_channels = slack_channels
+        self.verbose = verbose
 
-    name             = args.name
-    email            = args.email
-    role             = args.role
-    team             = args.team
-    github_username  = args.github_username
-    slack_invite_url = args.slack_invite_url
 
-    github_repo    = env["GITHUB_REPO"]
-    notion_page_id = env["NOTION_PARENT_PAGE_ID"]
-    slack_enabled  = env["SLACK_ENABLED"]
-
-    if slack_invite_url:
-        print(f"  Slack invite URL provided — will include in welcome email.")
-    else:
-        print(f"  ℹ️  No --slack-invite-url provided — Slack link won't appear in email.")
-
-    print(f"\n🚀 Starting onboarding for {name} ({email}) — {role} @ {team}\n")
-
-    # Build Composio session + agent
-    print("  Initializing Composio session...", end=" ", flush=True)
-    composio = Composio()
-    user_id  = os.getenv("COMPOSIO_USER_ID")
-    session  = composio.create(user_id=user_id)
-    print(f"✓  (session: {session.mcp.url.split('/')[-2]})\n")
+def run_onboarding(config: OnboardingConfig) -> Generator[dict, None, None]:
+    """
+    Run the full onboarding workflow.
+    Yields dicts describing each step's progress:
+      {"step": "init",   "status": "running"}
+      {"step": "notion", "status": "running"}
+      {"step": "notion", "status": "success", "url": "https://..."}
+      {"step": "notion", "status": "error",   "error": "..."}
+      {"step": "notion", "status": "skipped"}
+      {"step": "done",   "status": "success", "notion_url": "..."}
+    """
+    # --- Init ---
+    yield {"step": "init", "status": "running"}
+    try:
+        composio = Composio()
+        user_id = os.getenv("COMPOSIO_USER_ID")
+        session = composio.create(user_id=user_id)
+    except Exception as exc:
+        yield {"step": "init", "status": "error", "error": str(exc)}
+        return
 
     agent = Agent(
         name="Onboarding Agent",
@@ -307,138 +292,184 @@ def main():
             )
         ],
     )
+    yield {"step": "init", "status": "success"}
+
+    notion_url = None
+
+    # --- Notion ---
+    if config.enable_notion and config.notion_parent_page_id:
+        yield {"step": "notion", "status": "running"}
+        try:
+            success, output, auth_url = run_step(
+                agent,
+                prompt_notion(config.name, config.email, config.role, config.team, config.notion_parent_page_id),
+                verbose=config.verbose,
+            )
+            if success:
+                notion_url = extract_notion_url(output)
+                yield {"step": "notion", "status": "success", "url": notion_url, "output": output}
+            else:
+                yield {"step": "notion", "status": "error", "error": "Auth required", "auth_url": auth_url, "output": output}
+        except Exception as exc:
+            yield {"step": "notion", "status": "error", "error": str(exc)}
+    else:
+        reason = "disabled" if not config.enable_notion else "no_page_id"
+        yield {"step": "notion", "status": "skipped", "reason": reason}
+
+    # --- Gmail ---
+    if config.enable_gmail:
+        yield {"step": "gmail", "status": "running"}
+        try:
+            success, output, auth_url = run_step(
+                agent,
+                prompt_gmail(config.name, config.email, config.role, config.team,
+                             notion_url=notion_url, slack_invite_url=config.slack_invite_url),
+                verbose=config.verbose,
+            )
+            if success:
+                yield {"step": "gmail", "status": "success", "output": output}
+            else:
+                yield {"step": "gmail", "status": "error", "error": "Auth required", "auth_url": auth_url, "output": output}
+        except Exception as exc:
+            yield {"step": "gmail", "status": "error", "error": str(exc)}
+    else:
+        yield {"step": "gmail", "status": "skipped", "reason": "disabled"}
+
+    # --- GitHub ---
+    if config.enable_github and config.github_repo:
+        yield {"step": "github", "status": "running"}
+        try:
+            success, output, auth_url = run_step(
+                agent,
+                prompt_github(config.email, config.github_repo, config.github_username),
+                verbose=config.verbose,
+            )
+            if success:
+                yield {"step": "github", "status": "success", "output": output}
+            else:
+                yield {"step": "github", "status": "error", "error": "Auth required", "auth_url": auth_url, "output": output}
+        except Exception as exc:
+            yield {"step": "github", "status": "error", "error": str(exc)}
+    else:
+        reason = "disabled" if not config.enable_github else "no_repo"
+        yield {"step": "github", "status": "skipped", "reason": reason}
+
+    # --- Slack ---
+    slack_env_enabled = os.getenv("SLACK_ENABLED", "").lower() in ("1", "true", "yes")
+    if config.enable_slack and slack_env_enabled:
+        yield {"step": "slack", "status": "running"}
+        try:
+            success, output, auth_url = run_step(
+                agent,
+                prompt_slack(config.name, config.role, config.team, config.slack_channels),
+                verbose=config.verbose,
+            )
+            if success:
+                yield {"step": "slack", "status": "success", "output": output}
+            else:
+                yield {"step": "slack", "status": "error", "error": "Auth required", "auth_url": auth_url, "output": output}
+        except Exception as exc:
+            yield {"step": "slack", "status": "error", "error": str(exc)}
+    else:
+        reason = "disabled" if not config.enable_slack else "slack_env_disabled"
+        yield {"step": "slack", "status": "skipped", "reason": reason}
+
+    yield {"step": "done", "status": "success", "notion_url": notion_url}
+
+
+# ---------------------------------------------------------------------------
+# CLI (unchanged behaviour)
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Onboard a new team member across all tools.")
+    parser.add_argument("--name",             required=True)
+    parser.add_argument("--email",            required=True)
+    parser.add_argument("--role",             required=True)
+    parser.add_argument("--team",             required=True)
+    parser.add_argument("--github-username",  required=False, default=None)
+    parser.add_argument("--slack-invite-url", required=False, default=None)
+    parser.add_argument("--verbose", "-v",    action="store_true")
+    return parser.parse_args()
+
+
+def validate_env():
+    required = {
+        "COMPOSIO_API_KEY": os.getenv("COMPOSIO_API_KEY"),
+        "OPENAI_API_KEY":   os.getenv("OPENAI_API_KEY"),
+        "COMPOSIO_USER_ID": os.getenv("COMPOSIO_USER_ID"),
+    }
+    missing_required = [k for k, v in required.items() if not v]
+    if missing_required:
+        print(f"❌ Missing required env vars: {', '.join(missing_required)}")
+        sys.exit(1)
+
+
+def main():
+    args = parse_args()
+    validate_env()
+
+    config = OnboardingConfig(
+        name=args.name,
+        email=args.email,
+        role=args.role,
+        team=args.team,
+        github_username=args.github_username,
+        slack_invite_url=args.slack_invite_url,
+        verbose=args.verbose,
+        enable_slack=os.getenv("SLACK_ENABLED", "").lower() in ("1", "true", "yes"),
+    )
+
+    print(f"\n🚀 Starting onboarding for {config.name} ({config.email}) — {config.role} @ {config.team}\n")
 
     results  = {}
     failures = []
     notion_url = None
 
-    # ------------------------------------------------------------------
-    # Step 1 — Notion (run first so we can include the URL in the email)
-    # ------------------------------------------------------------------
-    notion_label = "📝 Creating Notion page"
-    print(f"{'='*50}")
-    if notion_page_id:
-        print(f"[1/4] {notion_label}...")
-        try:
-            success, output, auth_url = run_step(agent, prompt_notion(name, email, role, team, notion_page_id), verbose=verbose)
-            if success:
-                notion_url = extract_notion_url(output)
-                print(f"✓ {notion_label} — Done")
-                if notion_url:
-                    print(f"  📎 Page URL: {notion_url}")
-                else:
-                    print("  ⚠️  Could not extract Notion page URL from response")
-                results[notion_label] = output
-            else:
-                print(f"✗ {notion_label} — Auth required")
-                failures.append((notion_label, "Notion", output, auth_url))
-                if auth_url:
-                    print(f"  → Connect Notion here: {auth_url}")
-        except Exception as exc:
-            print(f"✗ {notion_label} — Error: {exc}")
-            failures.append((notion_label, "Notion", str(exc), None))
-    else:
-        print(f"[1/4] {notion_label}... ⏭  Skipped (NOTION_PARENT_PAGE_ID not set)")
+    for event in run_onboarding(config):
+        step   = event["step"]
+        status = event["status"]
 
-    # ------------------------------------------------------------------
-    # Step 2 — Gmail (now has Notion URL + Slack invite link)
-    # ------------------------------------------------------------------
-    gmail_label = "📧 Sending welcome email"
-    print(f"{'='*50}")
-    print(f"[2/4] {gmail_label}...")
-    if notion_url:
-        print(f"  ℹ️  Including Notion page URL in email: {notion_url}")
-    if slack_invite_url:
-        print(f"  ℹ️  Including Slack invite URL in email: {slack_invite_url}")
-    try:
-        success, output, auth_url = run_step(
-            agent,
-            prompt_gmail(name, email, role, team, notion_url=notion_url, slack_invite_url=slack_invite_url),
-            verbose=verbose,
-        )
-        if success:
-            print(f"✓ {gmail_label} — Done")
-            results[gmail_label] = output
-        else:
-            print(f"✗ {gmail_label} — Auth required")
-            failures.append((gmail_label, "Gmail", output, auth_url))
+        if step == "init":
+            if status == "running":
+                print("  Initializing Composio session...", end=" ", flush=True)
+            elif status == "success":
+                print("✓\n")
+            elif status == "error":
+                print(f"✗  {event['error']}")
+                sys.exit(1)
+
+        elif step == "done":
+            notion_url = event.get("notion_url")
+
+        elif status == "skipped":
+            print(f"{'='*50}")
+            print(f"⏭  {step} — Skipped ({event.get('reason', '')})")
+
+        elif status == "running":
+            print(f"{'='*50}")
+            print(f"▶  {step}...")
+
+        elif status == "success":
+            print(f"✓  {step} — Done")
+            results[step] = event.get("output", "")
+            if step == "notion" and event.get("url"):
+                print(f"   📎 Page URL: {event['url']}")
+
+        elif status == "error":
+            print(f"✗  {step} — {event.get('error', 'Unknown error')}")
+            auth_url = event.get("auth_url")
             if auth_url:
-                print(f"  → Connect Gmail here: {auth_url}")
-    except Exception as exc:
-        print(f"✗ {gmail_label} — Error: {exc}")
-        failures.append((gmail_label, "Gmail", str(exc), None))
+                print(f"   → Reconnect: {auth_url}")
+            failures.append((step, event.get("error"), auth_url))
 
-    # ------------------------------------------------------------------
-    # Step 3 — GitHub
-    # ------------------------------------------------------------------
-    github_label = "🐙 Inviting to GitHub repo"
-    print(f"{'='*50}")
-    if github_repo:
-        print(f"[3/4] {github_label}...")
-        try:
-            success, output, auth_url = run_step(agent, prompt_github(email, github_repo, github_username), verbose=verbose)
-            if success:
-                print(f"✓ {github_label} — Done")
-                results[github_label] = output
-            else:
-                print(f"✗ {github_label} — Auth required")
-                failures.append((github_label, "GitHub", output, auth_url))
-                if auth_url:
-                    print(f"  → Connect GitHub here: {auth_url}")
-        except Exception as exc:
-            print(f"✗ {github_label} — Error: {exc}")
-            failures.append((github_label, "GitHub", str(exc), None))
-    else:
-        print(f"[3/4] {github_label}... ⏭  Skipped (GITHUB_REPO not set)")
-
-    # ------------------------------------------------------------------
-    # Step 4 — Slack
-    # ------------------------------------------------------------------
-    slack_label = "💬 Posting to Slack"
-    print(f"{'='*50}")
-    if slack_enabled:
-        print(f"[4/4] {slack_label}...")
-        try:
-            success, output, auth_url = run_step(agent, prompt_slack(name, role, team), verbose=verbose)
-            if success:
-                print(f"✓ {slack_label} — Done")
-                results[slack_label] = output
-            else:
-                print(f"✗ {slack_label} — Auth required")
-                failures.append((slack_label, "Slack", output, auth_url))
-                if auth_url:
-                    print(f"  → Connect Slack here: {auth_url}")
-        except Exception as exc:
-            print(f"✗ {slack_label} — Error: {exc}")
-            failures.append((slack_label, "Slack", str(exc), None))
-    else:
-        print(f"[4/4] {slack_label}... ⏭  Skipped (SLACK_ENABLED not set)")
-
-    # ------------------------------------------------------------------
-    # Final summary
-    # ------------------------------------------------------------------
     print(f"\n{'='*50}")
     if not failures:
-        print(f"🎉 Onboarding complete for {name}!")
+        print(f"🎉 Onboarding complete for {config.name}!")
     else:
         print(f"⚠️  Onboarding finished: {len(results)} done, {len(failures)} failed")
-
-    if results:
-        print("\nCompleted:")
-        for label, output in results.items():
-            first_line = output.strip().split("\n")[0][:120]
-            print(f"  ✓ {label}: {first_line}")
-
     if notion_url:
         print(f"\n  📎 Notion page: {notion_url}")
-
-    if failures:
-        print("\nFailed (action needed):")
-        for label, app, output, auth_url in failures:
-            if auth_url:
-                print(f"  ✗ {app}: {auth_url}")
-            else:
-                print(f"  ✗ {app}: check logs above")
     print()
 
 
