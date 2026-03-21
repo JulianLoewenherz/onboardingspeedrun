@@ -35,7 +35,8 @@
       "Read(//Users/julianloewenherz/.railway/**)",
       "Read(//Users/julianloewenherz/.config/railway/**)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Frontend deploy:'''', d\\)\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Backend deploy:'''', d\\)\")"
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Backend deploy:'''', d\\)\")",
+      "Bash(railway service:*)"
     ]
   }
 }

@@ -1,30 +1,11 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
 import { Auth } from "@supabase/auth-ui-react";
 import { ThemeSupa } from "@supabase/auth-ui-shared";
 import { createClient } from "@/lib/supabase/client";
 
 export default function LoginPage() {
-  const router = useRouter();
   const supabase = createClient();
-
-  useEffect(() => {
-    console.log("[login] NEXT_PUBLIC_SUPABASE_URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
-    console.log("[login] NEXT_PUBLIC_SUPABASE_ANON_KEY set:", !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
-  }, []);
-
-  useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      console.log("[login] auth event:", event, "session:", session);
-      if (event === "SIGNED_IN") {
-        router.push("/");
-        router.refresh();
-      }
-    });
-    return () => subscription.unsubscribe();
-  }, [supabase, router]);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
