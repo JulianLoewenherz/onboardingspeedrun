@@ -24,7 +24,9 @@
       "Skill(update-config)",
       "Skill(update-config:*)",
       "Bash(curl -s -H \"Authorization: Bearer sbp_de7b462c78d390078cd70d25a4bda4f15b805c6c\" https://api.supabase.com/v1/projects)",
-      "Bash(python3 -m json.tool)"
+      "Bash(python3 -m json.tool)",
+      "Bash(npm install:*)",
+      "Bash(curl -s \"https://api.supabase.com/v1/projects/sjzeftqcaduigzgjxmjm/api-keys\" -H \"Authorization: Bearer sbp_de7b462c78d390078cd70d25a4bda4f15b805c6c\")"
     ]
   }
 }

@@ -170,11 +170,12 @@ def prompt_github(email, github_repo, github_username=None):
     )
 
 
-def prompt_slack(name, role, team, slack_channels=None):
-    channels = slack_channels or ["#all-testing-workspace", "#social"]
+def prompt_slack(name, role, team, slack_channels=None, workspace=None):
+    channels = slack_channels or ["#general", "#social"]
     ch1, ch2 = (channels + ["#social"])[:2]
+    workspace_hint = f" (workspace: {workspace})" if workspace else ""
     return (
-        f"Post the following two messages in Slack (workspace: testingworksp-2az7337.slack.com):\n"
+        f"Post the following two messages in Slack{workspace_hint}:\n"
         f"1. To {ch1}: \"👋 Please welcome {name} to the team! "
         f"They're joining as {role} on the {team} team. Say hello!\"\n"
         f"2. To {ch2}: \"{name} | {role} | {team} — starting today!\"\n"
@@ -231,6 +232,7 @@ class OnboardingConfig:
         github_repo: str | None = None,
         notion_parent_page_id: str | None = None,
         slack_channels: list[str] | None = None,
+        slack_workspace: str | None = None,
         verbose: bool = False,
     ):
         self.name = name
@@ -246,6 +248,7 @@ class OnboardingConfig:
         self.github_repo = github_repo or os.getenv("GITHUB_REPO")
         self.notion_parent_page_id = notion_parent_page_id or os.getenv("NOTION_PARENT_PAGE_ID")
         self.slack_channels = slack_channels
+        self.slack_workspace = slack_workspace
         self.verbose = verbose
 
 
@@ -361,7 +364,7 @@ def run_onboarding(config: OnboardingConfig) -> Generator[dict, None, None]:
         try:
             success, output, auth_url = run_step(
                 agent,
-                prompt_slack(config.name, config.role, config.team, config.slack_channels),
+                prompt_slack(config.name, config.role, config.team, config.slack_channels, config.slack_workspace),
                 verbose=config.verbose,
             )
             if success:

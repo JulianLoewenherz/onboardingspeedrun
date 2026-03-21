@@ -60,6 +60,7 @@ class SettingsUpdate(BaseModel):
     notion_parent_page_id: str | None = None
     slack_invite_url: str | None = None
     slack_channels: str | None = None
+    slack_workspace: str | None = None
     default_notion: bool | None = None
     default_github: bool | None = None
     default_slack: bool | None = None
@@ -98,6 +99,7 @@ async def _stream_onboarding(req: OnboardRequest):
         github_repo=settings.get("github_repo") or None,
         notion_parent_page_id=settings.get("notion_parent_page_id") or None,
         slack_channels=slack_channels,
+        slack_workspace=settings.get("slack_workspace") or None,
     )
 
     steps: list[dict] = []

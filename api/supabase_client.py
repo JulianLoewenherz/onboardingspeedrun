@@ -26,6 +26,7 @@ DEFAULT_SETTINGS = {
     "notion_parent_page_id": "",
     "slack_invite_url": "",
     "slack_channels": "#general,#social",
+    "slack_workspace": "",
     "default_notion": True,
     "default_github": True,
     "default_slack": True,
