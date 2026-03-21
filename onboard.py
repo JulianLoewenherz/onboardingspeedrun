@@ -142,12 +142,13 @@ def prompt_github(email, github_repo):
     )
 
 
-def prompt_slack(name, role, team):
+def prompt_slack(name, email, role, team):
     return (
-        f"Post two messages:\n"
-        f"1. To #general: \"👋 Please welcome {name} to the team! "
+        f"Do the following three things in Slack (workspace: testingworksp-2az7337.slack.com):\n"
+        f"1. Invite {email} to the Slack workspace so they can join.\n"
+        f"2. Post to #general: \"👋 Please welcome {name} to the team! "
         f"They're joining as {role} on the {team} team. Say hello!\"\n"
-        f"2. To #announcements: \"{name} | {role} | {team} — starting today!\""
+        f"3. Post to #announcements: \"{name} | {role} | {team} — starting today!\""
     )
 
 
@@ -227,7 +228,7 @@ def main():
     steps = [
         ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
         ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo) if github_repo else None),
-        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, role, team) if slack_enabled else None),
+        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, email, role, team) if slack_enabled else None),
         ("📝 Creating Notion page",    "Notion", prompt_notion(name, role, team, notion_page_id) if notion_page_id else None),
     ]
 
