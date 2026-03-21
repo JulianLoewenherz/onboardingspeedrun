@@ -11,7 +11,13 @@ export default function LoginPage() {
   const supabase = createClient();
 
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+    console.log("[login] NEXT_PUBLIC_SUPABASE_URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
+    console.log("[login] NEXT_PUBLIC_SUPABASE_ANON_KEY set:", !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+  }, []);
+
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log("[login] auth event:", event, "session:", session);
       if (event === "SIGNED_IN") {
         router.push("/");
         router.refresh();

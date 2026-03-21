@@ -26,7 +26,16 @@
       "Bash(curl -s -H \"Authorization: Bearer sbp_de7b462c78d390078cd70d25a4bda4f15b805c6c\" https://api.supabase.com/v1/projects)",
       "Bash(python3 -m json.tool)",
       "Bash(npm install:*)",
-      "Bash(curl -s \"https://api.supabase.com/v1/projects/sjzeftqcaduigzgjxmjm/api-keys\" -H \"Authorization: Bearer sbp_de7b462c78d390078cd70d25a4bda4f15b805c6c\")"
+      "Bash(curl -s \"https://api.supabase.com/v1/projects/sjzeftqcaduigzgjxmjm/api-keys\" -H \"Authorization: Bearer sbp_de7b462c78d390078cd70d25a4bda4f15b805c6c\")",
+      "Bash(railway --version)",
+      "Bash(railway whoami:*)",
+      "Bash(railway init:*)",
+      "Bash(railway link:*)",
+      "Bash(railway status:*)",
+      "Read(//Users/julianloewenherz/.railway/**)",
+      "Read(//Users/julianloewenherz/.config/railway/**)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Frontend deploy:'''', d\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Backend deploy:'''', d\\)\")"
     ]
   }
 }
