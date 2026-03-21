@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 import sys
 from datetime import date
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ def parse_args():
     parser.add_argument("--email", required=True, help="Work email")
     parser.add_argument("--role",  required=True, help="Job title, e.g. 'Backend Engineer'")
     parser.add_argument("--team",  required=True, help="Team name, e.g. 'Platform'")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print full agent responses")
     return parser.parse_args()
 
 
@@ -37,6 +39,7 @@ def validate_env():
     optional = {
         "GITHUB_REPO":           os.getenv("GITHUB_REPO"),
         "NOTION_PARENT_PAGE_ID": os.getenv("NOTION_PARENT_PAGE_ID"),
+        "SLACK_ENABLED":         os.getenv("SLACK_ENABLED", "").lower() in ("1", "true", "yes"),
     }
 
     missing_required = [k for k, v in required.items() if not v]
@@ -44,21 +47,73 @@ def validate_env():
         print(f"❌ Missing required env vars: {', '.join(missing_required)}")
         sys.exit(1)
 
-    for key, val in optional.items():
-        if not val:
-            print(f"⚠️  {key} not set — that step will be skipped.")
+    if not optional["GITHUB_REPO"]:
+        print("⚠️  GITHUB_REPO not set — GitHub step will be skipped.")
+    if not optional["NOTION_PARENT_PAGE_ID"]:
+        print("⚠️  NOTION_PARENT_PAGE_ID not set — Notion step will be skipped.")
+    if not optional["SLACK_ENABLED"]:
+        print("⚠️  SLACK_ENABLED not set — Slack step will be skipped. Set SLACK_ENABLED=true in .env when ready.")
 
     return optional
 
 
 # ---------------------------------------------------------------------------
-# Agent runner helper
+# Auth detection
 # ---------------------------------------------------------------------------
 
-def run_step(agent, prompt):
-    """Run a single agent call and return the final output string."""
+# Phrases the agent uses when a tool requires OAuth instead of actually acting
+AUTH_PHRASES = [
+    "connect.composio.dev",
+    "please connect",
+    "please complete",
+    "need to connect",
+    "requires authentication",
+    "authenticate",
+    "authorization",
+    "connect your",
+    "not connected",
+    "no available tools",
+    "i don't have",
+    "i do not have",
+    "unable to",
+    "cannot ",
+    "can't ",
+]
+
+def detect_auth_required(text: str) -> tuple[bool, str | None]:
+    """Return (needs_auth, connect_url_or_None) by inspecting the agent response."""
+    lower = text.lower()
+    needs_auth = any(phrase in lower for phrase in AUTH_PHRASES)
+    # Extract a composio.dev auth URL if present
+    match = re.search(r'https://connect\.composio\.dev/\S+', text)
+    url = match.group(0).rstrip(').,]') if match else None
+    return needs_auth, url
+
+
+# ---------------------------------------------------------------------------
+# Agent runner
+# ---------------------------------------------------------------------------
+
+def run_step(agent, prompt, verbose=False):
+    """
+    Run a single agent call.
+    Returns (success: bool, output: str).
+    Raises on unexpected exceptions.
+    """
+    if verbose:
+        print(f"\n  → Prompt sent to agent:\n    {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+
     result = Runner.run_sync(starting_agent=agent, input=prompt)
-    return result.final_output
+    output = result.final_output or ""
+
+    if verbose:
+        print(f"\n  ← Agent response:\n    {output}\n")
+
+    needs_auth, auth_url = detect_auth_required(output)
+    if needs_auth:
+        return False, output, auth_url
+
+    return True, output, None
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +180,7 @@ def prompt_notion(name, role, team, notion_page_id):
 def main():
     args = parse_args()
     env = validate_env()
+    verbose = args.verbose
 
     name  = args.name
     email = args.email
@@ -133,20 +189,25 @@ def main():
 
     github_repo    = env["GITHUB_REPO"]
     notion_page_id = env["NOTION_PARENT_PAGE_ID"]
+    slack_enabled  = env["SLACK_ENABLED"]
 
     print(f"\n🚀 Starting onboarding for {name} ({email}) — {role} @ {team}\n")
 
     # Build Composio session + agent
+    print("  Initializing Composio session...", end=" ", flush=True)
     composio = Composio()
     user_id  = os.getenv("COMPOSIO_USER_ID")
     session  = composio.create(user_id=user_id)
+    print(f"✓  (session: {session.mcp.url.split('/')[-2]})\n")
 
     agent = Agent(
         name="Onboarding Agent",
         instructions=(
             "You are an onboarding automation agent. "
             "Execute exactly the task given to you using the available Composio tools. "
-            "Be concise in your response — confirm what was done and include any relevant URLs or IDs."
+            "Do NOT ask the user questions — just execute. "
+            "If the tool succeeds, confirm what was done and include any relevant URLs or IDs. "
+            "If the tool is unavailable or requires authentication, say so explicitly."
         ),
         model="gpt-4o",
         tools=[
@@ -162,56 +223,75 @@ def main():
         ],
     )
 
-    # Define steps: (label, prompt_or_None)
+    # Define steps: (label, app_name, prompt_or_None)
     steps = [
-        ("📧 Sending welcome email",     prompt_gmail(name, email, role, team)),
-        ("🐙 Inviting to GitHub repo",   prompt_github(email, github_repo) if github_repo else None),
-        ("💬 Posting to Slack",          prompt_slack(name, role, team)),
-        ("📝 Creating Notion page",      prompt_notion(name, role, team, notion_page_id) if notion_page_id else None),
+        ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
+        ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo) if github_repo else None),
+        ("💬 Posting to Slack",        "Slack",  prompt_slack(name, role, team) if slack_enabled else None),
+        ("📝 Creating Notion page",    "Notion", prompt_notion(name, role, team, notion_page_id) if notion_page_id else None),
     ]
 
     total    = len(steps)
     results  = {}
     failures = []
 
-    for i, (label, prompt) in enumerate(steps, start=1):
+    for i, (label, app, prompt) in enumerate(steps, start=1):
         prefix = f"[{i}/{total}] {label}"
 
         if prompt is None:
-            print(f"{prefix}... ⏭  Skipped (not configured)")
+            reason = "not configured" if (app == "GitHub" and not github_repo) or (app == "Notion" and not notion_page_id) else "SLACK_ENABLED not set"
+            print(f"{prefix}... ⏭  Skipped ({reason})")
             continue
 
         print(f"{prefix}...", end=" ", flush=True)
         try:
-            output = run_step(agent, prompt)
-            print("✓ Done")
-            results[label] = output
+            success, output, auth_url = run_step(agent, prompt, verbose=verbose)
+
+            if success:
+                print("✓ Done")
+                results[label] = output
+                if not verbose:
+                    # Show a brief confirmation line
+                    first_line = output.strip().split("\n")[0][:120]
+                    print(f"     {first_line}")
+            else:
+                print("✗ Auth required")
+                failures.append((label, app, output, auth_url))
+                print(f"   [{app}] Not connected to Composio.")
+                if auth_url:
+                    print(f"   → Connect here: {auth_url}")
+                else:
+                    print(f"   → Visit https://app.composio.dev → All Toolkits → connect {app}")
+                if not verbose:
+                    print(f"   Agent said: {output.strip()[:200]}")
+
         except Exception as exc:
             msg = str(exc)
-            print(f"✗ Failed: {msg}")
-            failures.append((label, msg))
-
-            # Auth hint
-            for app in ("gmail", "github", "slack", "notion"):
-                if app in msg.lower():
-                    app_title = app.capitalize()
-                    print(f"   → [{app_title}] Not connected — visit app.composio.dev to connect {app_title} and retry.")
-                    break
+            print(f"✗ Error: {msg[:120]}")
+            failures.append((label, app, msg, None))
 
     # Final summary
-    print(f"\n{'🎉 Onboarding complete for ' + name + '!' if not failures else '⚠️  Onboarding finished with errors.'}\n")
+    succeeded = total - len([s for s in steps if s[2] is None]) - len(failures)
+    skipped   = len([s for s in steps if s[2] is None])
+
+    print(f"\n{'─' * 50}")
+    if not failures:
+        print(f"🎉 Onboarding complete for {name}!")
+    else:
+        print(f"⚠️  Onboarding finished: {succeeded} done, {len(failures)} need attention, {skipped} skipped")
 
     if results:
-        print("Summary:")
+        print("\nCompleted:")
         for label, output in results.items():
-            # Print first meaningful line of each result
-            first_line = output.strip().split("\n")[0][:120]
-            print(f"  {label}: {first_line}")
+            first_line = output.strip().split("\n")[0][:100]
+            print(f"  ✓ {label}: {first_line}")
 
     if failures:
-        print("\nFailed steps:")
-        for label, msg in failures:
-            print(f"  ✗ {label}: {msg[:120]}")
+        print("\nNeeds attention (connect these apps at app.composio.dev):")
+        for label, app, output, auth_url in failures:
+            print(f"  ✗ {app}: {auth_url or 'visit app.composio.dev → All Toolkits → ' + app}")
+
+    print()
 
 
 if __name__ == "__main__":
