@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from datetime import date
 from dotenv import load_dotenv
 from composio import Composio
@@ -18,11 +19,11 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Onboard a new team member across all tools.")
-    parser.add_argument("--name",  required=True, help="Full name, e.g. 'Alex Chen'")
-    parser.add_argument("--email", required=True, help="Work email")
-    parser.add_argument("--role",  required=True, help="Job title, e.g. 'Backend Engineer'")
-    parser.add_argument("--team",  required=True, help="Team name, e.g. 'Platform'")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print full agent responses")
+    parser.add_argument("--name",  required=True)
+    parser.add_argument("--email", required=True)
+    parser.add_argument("--role",  required=True)
+    parser.add_argument("--team",  required=True)
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show full agent responses and tool calls")
     return parser.parse_args()
 
 
@@ -61,7 +62,6 @@ def validate_env():
 # Auth detection
 # ---------------------------------------------------------------------------
 
-# Phrases the agent uses when a tool requires OAuth instead of actually acting
 AUTH_PHRASES = [
     "connect.composio.dev",
     "please connect",
@@ -69,25 +69,46 @@ AUTH_PHRASES = [
     "need to connect",
     "requires authentication",
     "authenticate",
-    "authorization",
     "connect your",
     "not connected",
     "no available tools",
     "i don't have",
     "i do not have",
-    "unable to",
-    "cannot ",
-    "can't ",
 ]
 
 def detect_auth_required(text: str) -> tuple[bool, str | None]:
-    """Return (needs_auth, connect_url_or_None) by inspecting the agent response."""
     lower = text.lower()
     needs_auth = any(phrase in lower for phrase in AUTH_PHRASES)
-    # Extract a composio.dev auth URL if present
     match = re.search(r'https://connect\.composio\.dev/\S+', text)
     url = match.group(0).rstrip(').,]') if match else None
     return needs_auth, url
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def log_tool_calls(result):
+    """Extract and print every tool call the agent made."""
+    try:
+        for msg in result.new_messages():
+            # Tool call requests (assistant side)
+            if hasattr(msg, "content") and isinstance(msg.content, list):
+                for block in msg.content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        print(f"     🔧 Tool call: {block.name}")
+                        if hasattr(block, "input") and block.input:
+                            for k, v in block.input.items():
+                                val_str = str(v)[:120]
+                                print(f"        {k}: {val_str}")
+            # Tool results (tool side)
+            if hasattr(msg, "role") and msg.role == "tool":
+                content = getattr(msg, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(str(c) for c in content)
+                print(f"     📥 Tool result: {str(content)[:300]}")
+    except Exception as e:
+        print(f"     (could not extract tool calls: {e})")
 
 
 # ---------------------------------------------------------------------------
@@ -96,18 +117,27 @@ def detect_auth_required(text: str) -> tuple[bool, str | None]:
 
 def run_step(agent, prompt, verbose=False):
     """
-    Run a single agent call.
-    Returns (success: bool, output: str).
-    Raises on unexpected exceptions.
+    Run one agent step.
+    Always prints the full agent response.
+    Returns (success, output, auth_url).
     """
     if verbose:
-        print(f"\n  → Prompt sent to agent:\n    {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+        print(f"\n  PROMPT →\n  {prompt}\n")
 
+    t0 = time.time()
     result = Runner.run_sync(starting_agent=agent, input=prompt)
+    elapsed = time.time() - t0
     output = result.final_output or ""
 
-    if verbose:
-        print(f"\n  ← Agent response:\n    {output}\n")
+    # Always show tool calls
+    print(f"\n  ⏱  {elapsed:.1f}s — Tool calls made:")
+    log_tool_calls(result)
+
+    # Always show full agent response
+    print(f"\n  Agent response:\n  {'─'*40}")
+    for line in output.strip().split("\n"):
+        print(f"  {line}")
+    print(f"  {'─'*40}\n")
 
     needs_auth, auth_url = detect_auth_required(output)
     if needs_auth:
@@ -136,41 +166,44 @@ def prompt_gmail(name, email, role, team):
 def prompt_github(email, github_repo):
     owner, repo = github_repo.split("/", 1)
     return (
-        f"Invite {email} as a collaborator to the GitHub repository {github_repo}. "
-        f"The owner is '{owner}' and the repo name is '{repo}'. "
-        f"Use the GitHub add collaborator tool for a repo (not an org)."
+        f"Invite the email address {email} as a collaborator to the GitHub repository '{repo}' owned by '{owner}'. "
+        f"Use the 'add collaborator to repo' tool with the email address {email} directly — do NOT look up a username. "
+        f"The full repo path is {github_repo}."
     )
 
 
 def prompt_slack(name, email, role, team):
     return (
-        f"Do the following three things in Slack (workspace: testingworksp-2az7337.slack.com):\n"
-        f"1. Invite {email} to the Slack workspace so they can join.\n"
-        f"2. Post to #general: \"👋 Please welcome {name} to the team! "
+        f"Do the following in Slack (workspace: testingworksp-2az7337.slack.com):\n"
+        f"1. Invite the email address {email} to the Slack workspace.\n"
+        f"2. Post to #all-testing-workspace: \"👋 Please welcome {name} to the team! "
         f"They're joining as {role} on the {team} team. Say hello!\"\n"
-        f"3. Post to #announcements: \"{name} | {role} | {team} — starting today!\""
+        f"3. Post to #social: \"{name} | {role} | {team} — starting today!\"\n"
+        f"For each action, confirm whether it succeeded or failed."
     )
 
 
-def prompt_notion(name, role, team, notion_page_id):
+def prompt_notion(name, email, role, team, notion_page_id):
     today = date.today().strftime("%B %d, %Y")
     return (
-        f"Create a new page inside the Notion page with ID {notion_page_id}.\n"
-        f'Page title: "{name} — Onboarding ({today})"\n'
-        f"Page content:\n"
-        f'- H1 header: "Welcome, {name}!"\n'
-        f"- Their role: {role}, team: {team}\n"
-        f'- H2 section "First Week Checklist" with these tasks as checkboxes:\n'
-        f"  * Set up your dev environment\n"
-        f"  * Read the team wiki\n"
-        f"  * 1:1 with your manager (Day 1)\n"
-        f"  * Join team standup (Day 2)\n"
-        f"  * Complete security training\n"
-        f"  * Make your first PR\n"
-        f"  * Meet with each team member (Week 1)\n"
-        f"  * 30-day goals check-in\n"
-        f'- H2 section "Your Tools" listing: GitHub, Slack, Linear, Notion, Gmail\n'
-        f"Return the URL of the created page."
+        f"Do the following in Notion:\n"
+        f"1. Create a new page inside the Notion page with ID {notion_page_id}.\n"
+        f'   Page title: "{name} — Onboarding ({today})"\n'
+        f"   Page content:\n"
+        f'   - H1 header: "Welcome, {name}!"\n'
+        f"   - Their role: {role}, team: {team}\n"
+        f'   - H2 section "First Week Checklist" with checkboxes:\n'
+        f"     * Set up your dev environment\n"
+        f"     * Read the team wiki\n"
+        f"     * 1:1 with your manager (Day 1)\n"
+        f"     * Join team standup (Day 2)\n"
+        f"     * Complete security training\n"
+        f"     * Make your first PR\n"
+        f"     * Meet with each team member (Week 1)\n"
+        f"     * 30-day goals check-in\n"
+        f'   - H2 section "Your Tools" listing: GitHub, Slack, Notion, Gmail\n'
+        f"2. Invite {email} to the Notion workspace so they can access the page.\n"
+        f"Return the URL of the created page and confirm whether the invite was sent."
     )
 
 
@@ -205,10 +238,10 @@ def main():
         name="Onboarding Agent",
         instructions=(
             "You are an onboarding automation agent. "
-            "Execute exactly the task given to you using the available Composio tools. "
-            "Do NOT ask the user questions — just execute. "
-            "If the tool succeeds, confirm what was done and include any relevant URLs or IDs. "
-            "If the tool is unavailable or requires authentication, say so explicitly."
+            "Execute exactly the tasks given using the available Composio tools. "
+            "Do NOT ask the user questions — just execute each task. "
+            "For each sub-task, report: what you did, whether it succeeded or failed, and any relevant URLs or IDs. "
+            "If a tool is unavailable or requires authentication, say so explicitly."
         ),
         model="gpt-4o",
         tools=[
@@ -224,12 +257,12 @@ def main():
         ],
     )
 
-    # Define steps: (label, app_name, prompt_or_None)
+    # Steps: (label, app_name, prompt_or_None)
     steps = [
         ("📧 Sending welcome email",   "Gmail",  prompt_gmail(name, email, role, team)),
         ("🐙 Inviting to GitHub repo", "GitHub", prompt_github(email, github_repo) if github_repo else None),
         ("💬 Posting to Slack",        "Slack",  prompt_slack(name, email, role, team) if slack_enabled else None),
-        ("📝 Creating Notion page",    "Notion", prompt_notion(name, role, team, notion_page_id) if notion_page_id else None),
+        ("📝 Creating Notion page",    "Notion", prompt_notion(name, email, role, team, notion_page_id) if notion_page_id else None),
     ]
 
     total    = len(steps)
@@ -237,61 +270,56 @@ def main():
     failures = []
 
     for i, (label, app, prompt) in enumerate(steps, start=1):
+        print(f"{'='*50}")
         prefix = f"[{i}/{total}] {label}"
 
         if prompt is None:
-            reason = "not configured" if (app == "GitHub" and not github_repo) or (app == "Notion" and not notion_page_id) else "SLACK_ENABLED not set"
-            print(f"{prefix}... ⏭  Skipped ({reason})")
+            print(f"{prefix}... ⏭  Skipped (not configured)")
             continue
 
-        print(f"{prefix}...", end=" ", flush=True)
+        print(f"{prefix}...")
+
         try:
             success, output, auth_url = run_step(agent, prompt, verbose=verbose)
 
             if success:
-                print("✓ Done")
+                print(f"✓ {label} — Done")
                 results[label] = output
-                if not verbose:
-                    # Show a brief confirmation line
-                    first_line = output.strip().split("\n")[0][:120]
-                    print(f"     {first_line}")
             else:
-                print("✗ Auth required")
+                print(f"✗ {label} — Auth required")
                 failures.append((label, app, output, auth_url))
-                print(f"   [{app}] Not connected to Composio.")
                 if auth_url:
-                    print(f"   → Connect here: {auth_url}")
+                    print(f"  → Connect {app} here: {auth_url}")
                 else:
-                    print(f"   → Visit https://app.composio.dev → All Toolkits → connect {app}")
-                if not verbose:
-                    print(f"   Agent said: {output.strip()[:200]}")
+                    print(f"  → Visit https://app.composio.dev → All Toolkits → connect {app}")
 
         except Exception as exc:
             msg = str(exc)
-            print(f"✗ Error: {msg[:120]}")
+            print(f"✗ {label} — Error: {msg}")
             failures.append((label, app, msg, None))
 
     # Final summary
-    succeeded = total - len([s for s in steps if s[2] is None]) - len(failures)
-    skipped   = len([s for s in steps if s[2] is None])
-
-    print(f"\n{'─' * 50}")
+    skipped   = sum(1 for s in steps if s[2] is None)
+    succeeded = len(results)
+    print(f"\n{'='*50}")
     if not failures:
         print(f"🎉 Onboarding complete for {name}!")
     else:
-        print(f"⚠️  Onboarding finished: {succeeded} done, {len(failures)} need attention, {skipped} skipped")
+        print(f"⚠️  Onboarding finished: {succeeded} done, {len(failures)} failed, {skipped} skipped")
 
     if results:
         print("\nCompleted:")
         for label, output in results.items():
-            first_line = output.strip().split("\n")[0][:100]
+            first_line = output.strip().split("\n")[0][:120]
             print(f"  ✓ {label}: {first_line}")
 
     if failures:
-        print("\nNeeds attention (connect these apps at app.composio.dev):")
+        print("\nFailed (action needed):")
         for label, app, output, auth_url in failures:
-            print(f"  ✗ {app}: {auth_url or 'visit app.composio.dev → All Toolkits → ' + app}")
-
+            if auth_url:
+                print(f"  ✗ {app}: {auth_url}")
+            else:
+                print(f"  ✗ {app}: check logs above")
     print()
 
 
